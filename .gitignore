@@ -1,0 +1,16 @@
+# Игнорируем папки с компиляцией и временными данными
+Binaries/
+Intermediate/
+Saved/
+DerivedDataCache/
+Build/
+
+# Игнорируем файлы Visual Studio
+.vs/
+*.sln
+*.suo
+*.user
+
+# Игнорируем системный мусор
+.DS_Store
+Thumbs.db
