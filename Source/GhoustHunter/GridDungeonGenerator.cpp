@@ -1,6 +1,8 @@
 #include "GridDungeonGenerator.h"
 #include "Engine/World.h"
 #include "DrawDebugHelpers.h"
+#include <functional> 
+#include <algorithm> 
 
 AGridDungeonGenerator::AGridDungeonGenerator()
 {
@@ -29,13 +31,28 @@ void AGridDungeonGenerator::PostEditChangeProperty(FPropertyChangedEvent& Proper
 }
 #endif
 
+// ========== НОВЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С СИДОМ ==========
+
+int32 AGridDungeonGenerator::GetRandomSeed()
+{
+    // Просто возвращает случайное число, не влияя на генерацию
+    return FMath::Rand();
+}
+
+void AGridDungeonGenerator::SetSeedAndGenerate(int32 NewSeed)
+{
+    Seed = NewSeed;
+    bUseRandomSeed = false;
+    GenerateDungeon();
+}
+
 // ========== ОСНОВНАЯ ГЕНЕРАЦИЯ ==========
 
 void AGridDungeonGenerator::GenerateDungeon()
 {
     ClearDungeon();
 
-    // Установка сида
+    // Определяем сид
     if (bUseRandomSeed || Seed == 0)
     {
         CurrentSeed = FMath::Rand();
@@ -44,10 +61,14 @@ void AGridDungeonGenerator::GenerateDungeon()
     {
         CurrentSeed = Seed;
     }
+
+    // Инициализируем свой генератор случайных чисел
+    RNG.Initialize(CurrentSeed);
+
+    // Также инициализируем глобальный (для совместимости)
     FMath::RandInit(CurrentSeed);
 
-    UE_LOG(LogTemp, Log, TEXT("Generating dungeon with seed: %d, grid: %dx%d at location: %s"),
-        CurrentSeed, GridWidth, GridHeight, *GetActorLocation().ToString());
+    UE_LOG(LogTemp, Log, TEXT("Generating dungeon with seed: %d, grid: %dx%d"), CurrentSeed, GridWidth, GridHeight);
 
     bool bSuccess = false;
     int32 Attempts = 0;
@@ -86,6 +107,18 @@ void AGridDungeonGenerator::GenerateDungeon()
         CreateMinimalDungeon();
     }
 
+    if (bApplyMazePostProcess)
+    {
+        PostProcessWallsToCreateMaze();
+    }
+
+    ClassifyRegions();
+
+    if (bPrintRegionTypes)
+    {
+        DebugPrintRegions();
+    }
+
     SpawnRooms();
 
     if (bDrawDebugGrid)
@@ -98,7 +131,6 @@ void AGridDungeonGenerator::GenerateDungeon()
 
 void AGridDungeonGenerator::CreateMinimalDungeon()
 {
-    // Принудительно создаем простой крест из комнат
     Grid.SetNum(GridHeight);
     for (int32 Y = 0; Y < GridHeight; Y++)
     {
@@ -106,19 +138,25 @@ void AGridDungeonGenerator::CreateMinimalDungeon()
         for (int32 X = 0; X < GridWidth; X++)
         {
             Grid[Y][X].bIsRoom = false;
+            Grid[Y][X].BlockedWalls = 0;
         }
     }
 
     int32 CenterX = GridWidth / 2;
     int32 CenterY = GridHeight / 2;
 
-    // Создаем крест
     for (int32 I = -3; I <= 3; I++)
     {
         if (IsValidCell(CenterX + I, CenterY))
+        {
             Grid[CenterY][CenterX + I].bIsRoom = true;
+            Grid[CenterY][CenterX + I].BlockedWalls = 0;
+        }
         if (IsValidCell(CenterX, CenterY + I))
+        {
             Grid[CenterY + I][CenterX].bIsRoom = true;
+            Grid[CenterY + I][CenterX].BlockedWalls = 0;
+        }
     }
 }
 
@@ -133,6 +171,7 @@ void AGridDungeonGenerator::ClearDungeon()
     }
     SpawnedRooms.Empty();
     Grid.Empty();
+    RegionCache.Empty();
 }
 
 void AGridDungeonGenerator::RegenerateWithSameSeed()
@@ -152,20 +191,22 @@ void AGridDungeonGenerator::InitializeGrid()
         Grid[Y].SetNum(GridWidth);
         for (int32 X = 0; X < GridWidth; X++)
         {
+            Grid[Y][X].BlockedWalls = 0;
+
             if (X == 0 || X == GridWidth - 1 || Y == 0 || Y == GridHeight - 1)
             {
                 Grid[Y][X].bIsRoom = false;
             }
             else
             {
-                // Центр всегда комната для связности
                 if (X == GridWidth / 2 && Y == GridHeight / 2)
                 {
                     Grid[Y][X].bIsRoom = true;
                 }
                 else
                 {
-                    Grid[Y][X].bIsRoom = FMath::RandRange(0, 100) < InitFillPercent;
+                    // Используем RNG вместо FMath::RandRange
+                    Grid[Y][X].bIsRoom = RNG.RandRange(0, 100) < InitFillPercent;
                 }
             }
         }
@@ -190,7 +231,6 @@ void AGridDungeonGenerator::ApplyCellularRules()
 
             if (Grid[Y][X].bIsRoom)
             {
-                // Комната умирает только если нет соседей
                 if (Neighbors < 2)
                 {
                     NewGrid[Y][X].bIsRoom = false;
@@ -198,7 +238,6 @@ void AGridDungeonGenerator::ApplyCellularRules()
             }
             else
             {
-                // Рождение комнаты если есть 2-3 соседа
                 if (Neighbors >= 2 && Neighbors <= 3)
                 {
                     NewGrid[Y][X].bIsRoom = true;
@@ -259,6 +298,7 @@ void AGridDungeonGenerator::FillInteriorHoles()
     for (const FIntPoint& Hole : HolesToFill)
     {
         Grid[Hole.Y][Hole.X].bIsRoom = true;
+        Grid[Hole.Y][Hole.X].BlockedWalls = 0;
     }
 }
 
@@ -266,6 +306,8 @@ void AGridDungeonGenerator::FillInteriorHoles()
 
 void AGridDungeonGenerator::RemoveIsolatedRooms()
 {
+    if (!bRemoveIsolatedRooms) return;
+
     TArray<FIntPoint> LargestCluster = GetLargestCluster();
 
     if (LargestCluster.Num() == 0) return;
@@ -290,6 +332,8 @@ void AGridDungeonGenerator::RemoveIsolatedRooms()
 
 void AGridDungeonGenerator::EnsureAllRoomsConnected()
 {
+    if (!bEnsureConnectivity) return;
+
     TArray<FIntPoint> RoomPositions = GetAllRoomPositions();
     if (RoomPositions.Num() <= 1) return;
 
@@ -440,6 +484,7 @@ void AGridDungeonGenerator::AddCorridor(const FIntPoint& Start, const FIntPoint&
         if (IsValidCell(X, Y))
         {
             Grid[Y][X].bIsRoom = true;
+            Grid[Y][X].BlockedWalls = 0;
         }
     }
 
@@ -449,8 +494,402 @@ void AGridDungeonGenerator::AddCorridor(const FIntPoint& Start, const FIntPoint&
         if (IsValidCell(X, Y))
         {
             Grid[Y][X].bIsRoom = true;
+            Grid[Y][X].BlockedWalls = 0;
         }
     }
+}
+
+// ========== ЛАБИРИНТ (ПОСТОБРАБОТКА СТЕН) ==========
+
+void AGridDungeonGenerator::PostProcessWallsToCreateMaze()
+{
+    if (WallRestoreChance <= 0.0f) return;
+
+    TArray<TArray<FIntPoint>> AllRegions;
+    TArray<TArray<bool>> Visited;
+
+    Visited.SetNum(GridHeight);
+    for (int32 Y = 0; Y < GridHeight; Y++)
+    {
+        Visited[Y].SetNum(GridWidth);
+        for (int32 X = 0; X < GridWidth; X++)
+        {
+            Visited[Y][X] = false;
+        }
+    }
+
+    for (int32 Y = 0; Y < GridHeight; Y++)
+    {
+        for (int32 X = 0; X < GridWidth; X++)
+        {
+            if (HasRoomAt(X, Y) && !Visited[Y][X])
+            {
+                TArray<FIntPoint> Region;
+                TQueue<FIntPoint> Queue;
+                Queue.Enqueue(FIntPoint(X, Y));
+                Visited[Y][X] = true;
+
+                while (!Queue.IsEmpty())
+                {
+                    FIntPoint Current;
+                    Queue.Dequeue(Current);
+                    Region.Add(Current);
+
+                    TArray<FIntPoint> Neighbors;
+                    if (HasRoomAt(Current.X + 1, Current.Y) && !IsWallBlocked(Current, 0))
+                        Neighbors.Add(FIntPoint(Current.X + 1, Current.Y));
+                    if (HasRoomAt(Current.X - 1, Current.Y) && !IsWallBlocked(Current, 2))
+                        Neighbors.Add(FIntPoint(Current.X - 1, Current.Y));
+                    if (HasRoomAt(Current.X, Current.Y + 1) && !IsWallBlocked(Current, 1))
+                        Neighbors.Add(FIntPoint(Current.X, Current.Y + 1));
+                    if (HasRoomAt(Current.X, Current.Y - 1) && !IsWallBlocked(Current, 3))
+                        Neighbors.Add(FIntPoint(Current.X, Current.Y - 1));
+
+                    for (const FIntPoint& Neighbor : Neighbors)
+                    {
+                        if (!Visited[Neighbor.Y][Neighbor.X])
+                        {
+                            Visited[Neighbor.Y][Neighbor.X] = true;
+                            Queue.Enqueue(Neighbor);
+                        }
+                    }
+                }
+
+                if (Region.Num() > 0)
+                {
+                    AllRegions.Add(Region);
+                }
+            }
+        }
+    }
+
+    for (const TArray<FIntPoint>& Region : AllRegions)
+    {
+        int32 MinX = GridWidth, MaxX = -1, MinY = GridHeight, MaxY = -1;
+        for (const FIntPoint& Cell : Region)
+        {
+            MinX = FMath::Min(MinX, Cell.X);
+            MaxX = FMath::Max(MaxX, Cell.X);
+            MinY = FMath::Min(MinY, Cell.Y);
+            MaxY = FMath::Max(MaxY, Cell.Y);
+        }
+
+        int32 Width = MaxX - MinX + 1;
+        int32 Height = MaxY - MinY + 1;
+
+        if (Width >= 4 && Height >= 4 && Region.Num() >= 8)
+        {
+            CreateInternalMaze(Region, MinX, MaxX, MinY, MaxY);
+        }
+        else if (Region.Num() >= 6)
+        {
+            AddRandomWallsToRegion(Region);
+        }
+    }
+}
+
+void AGridDungeonGenerator::CreateInternalMaze(const TArray<FIntPoint>& Region, int32 MinX, int32 MaxX, int32 MinY, int32 MaxY)
+{
+    int32 MazeWidth = MaxX - MinX + 1;
+    int32 MazeHeight = MaxY - MinY + 1;
+
+    // Сначала удаляем ВСЕ внутренние стены
+    for (int32 Y = MinY; Y <= MaxY; Y++)
+    {
+        for (int32 X = MinX; X <= MaxX; X++)
+        {
+            if (HasRoomAt(X, Y))
+            {
+                if (HasRoomAt(X, Y + 1))
+                {
+                    Grid[Y][X].BlockedWalls &= ~(1 << 1);
+                    Grid[Y + 1][X].BlockedWalls &= ~(1 << 3);
+                }
+                if (HasRoomAt(X + 1, Y))
+                {
+                    Grid[Y][X].BlockedWalls &= ~(1 << 0);
+                    Grid[Y][X + 1].BlockedWalls &= ~(1 << 2);
+                }
+            }
+        }
+    }
+
+    TArray<TPair<FIntPoint, int32>> AllWalls;
+
+    for (int32 Y = MinY; Y <= MaxY; Y++)
+    {
+        for (int32 X = MinX; X <= MaxX; X++)
+        {
+            if (!HasRoomAt(X, Y)) continue;
+
+            if (HasRoomAt(X + 1, Y))
+            {
+                AllWalls.Add(TPair<FIntPoint, int32>(FIntPoint(X, Y), 0));
+            }
+            if (HasRoomAt(X, Y + 1))
+            {
+                AllWalls.Add(TPair<FIntPoint, int32>(FIntPoint(X, Y), 1));
+            }
+        }
+    }
+
+    // Используем RNG для перемешивания
+    for (int32 I = AllWalls.Num() - 1; I > 0; I--)
+    {
+        int32 J = RNG.RandRange(0, I);
+        AllWalls.Swap(I, J);
+    }
+
+    TMap<FIntPoint, FIntPoint> Parent;
+    for (const FIntPoint& Cell : Region)
+    {
+        Parent.Add(Cell, Cell);
+    }
+
+    std::function<FIntPoint(FIntPoint)> Find = [&](FIntPoint P) -> FIntPoint
+        {
+            if (Parent[P] == P) return P;
+            Parent[P] = Find(Parent[P]);
+            return Parent[P];
+        };
+
+    auto Union = [&](FIntPoint A, FIntPoint B)
+        {
+            FIntPoint RootA = Find(A);
+            FIntPoint RootB = Find(B);
+            if (RootA != RootB) Parent[RootA] = RootB;
+        };
+
+    TArray<TPair<FIntPoint, int32>> MSTWalls;
+
+    for (const auto& Wall : AllWalls)
+    {
+        FIntPoint RoomA = Wall.Key;
+        int32 Dir = Wall.Value;
+        FIntPoint RoomB = (Dir == 0) ? FIntPoint(RoomA.X + 1, RoomA.Y) : FIntPoint(RoomA.X, RoomA.Y + 1);
+
+        if (Find(RoomA) != Find(RoomB))
+        {
+            Union(RoomA, RoomB);
+        }
+        else
+        {
+            // Используем RNG для случайного восстановления стен
+            if (RNG.FRand() < WallRestoreChance)
+            {
+                MSTWalls.Add(Wall);
+            }
+        }
+    }
+
+    for (const auto& Wall : MSTWalls)
+    {
+        FIntPoint RoomA = Wall.Key;
+        int32 Dir = Wall.Value;
+        FIntPoint RoomB = (Dir == 0) ? FIntPoint(RoomA.X + 1, RoomA.Y) : FIntPoint(RoomA.X, RoomA.Y + 1);
+        RestoreWallBetween(RoomA, RoomB);
+    }
+}
+
+void AGridDungeonGenerator::AddRandomWallsToRegion(const TArray<FIntPoint>& Region)
+{
+    if (Region.Num() < 5) return;
+
+    TArray<TPair<FIntPoint, int32>> PossibleWalls;
+
+    for (const FIntPoint& Cell : Region)
+    {
+        if (HasRoomAt(Cell.X + 1, Cell.Y) && !IsWallBlocked(Cell, 0))
+        {
+            PossibleWalls.Add(TPair<FIntPoint, int32>(Cell, 0));
+        }
+        if (HasRoomAt(Cell.X, Cell.Y + 1) && !IsWallBlocked(Cell, 1))
+        {
+            PossibleWalls.Add(TPair<FIntPoint, int32>(Cell, 1));
+        }
+    }
+
+    // Используем RNG для перемешивания
+    for (int32 I = PossibleWalls.Num() - 1; I > 0; I--)
+    {
+        int32 J = RNG.RandRange(0, I);
+        PossibleWalls.Swap(I, J);
+    }
+
+    int32 WallsToAdd = FMath::Min(FMath::CeilToInt(PossibleWalls.Num() * 0.2f), PossibleWalls.Num() - 3);
+
+    for (int32 I = 0; I < WallsToAdd; I++)
+    {
+        const auto& Wall = PossibleWalls[I];
+        FIntPoint RoomA = Wall.Key;
+        int32 Direction = Wall.Value;
+        FIntPoint RoomB = (Direction == 0) ? FIntPoint(RoomA.X + 1, RoomA.Y) : FIntPoint(RoomA.X, RoomA.Y + 1);
+
+        int32 ConnectionsA = 0;
+        int32 ConnectionsB = 0;
+
+        if (HasRoomAt(RoomA.X + 1, RoomA.Y) && !IsWallBlocked(RoomA, 0)) ConnectionsA++;
+        if (HasRoomAt(RoomA.X - 1, RoomA.Y) && !IsWallBlocked(RoomA, 2)) ConnectionsA++;
+        if (HasRoomAt(RoomA.X, RoomA.Y + 1) && !IsWallBlocked(RoomA, 1)) ConnectionsA++;
+        if (HasRoomAt(RoomA.X, RoomA.Y - 1) && !IsWallBlocked(RoomA, 3)) ConnectionsA++;
+
+        if (HasRoomAt(RoomB.X + 1, RoomB.Y) && !IsWallBlocked(RoomB, 0)) ConnectionsB++;
+        if (HasRoomAt(RoomB.X - 1, RoomB.Y) && !IsWallBlocked(RoomB, 2)) ConnectionsB++;
+        if (HasRoomAt(RoomB.X, RoomB.Y + 1) && !IsWallBlocked(RoomB, 1)) ConnectionsB++;
+        if (HasRoomAt(RoomB.X, RoomB.Y - 1) && !IsWallBlocked(RoomB, 3)) ConnectionsB++;
+
+        if (ConnectionsA > 1 && ConnectionsB > 1)
+        {
+            RestoreWallBetween(RoomA, RoomB);
+        }
+    }
+}
+
+void AGridDungeonGenerator::RestoreWallBetween(const FIntPoint& RoomA, const FIntPoint& RoomB)
+{
+    if (RoomB.X == RoomA.X + 1)
+    {
+        BlockWallAt(RoomA, 0);
+        BlockWallAt(RoomB, 2);
+    }
+    else if (RoomB.X == RoomA.X - 1)
+    {
+        BlockWallAt(RoomA, 2);
+        BlockWallAt(RoomB, 0);
+    }
+    else if (RoomB.Y == RoomA.Y + 1)
+    {
+        BlockWallAt(RoomA, 1);
+        BlockWallAt(RoomB, 3);
+    }
+    else if (RoomB.Y == RoomA.Y - 1)
+    {
+        BlockWallAt(RoomA, 3);
+        BlockWallAt(RoomB, 1);
+    }
+}
+
+void AGridDungeonGenerator::BlockWallAt(const FIntPoint& Room, int32 Direction)
+{
+    if (!IsValidCell(Room.X, Room.Y)) return;
+    Grid[Room.Y][Room.X].BlockedWalls |= (1 << Direction);
+}
+
+bool AGridDungeonGenerator::IsWallBlocked(const FIntPoint& Room, int32 Direction) const
+{
+    if (!IsValidCell(Room.X, Room.Y)) return true;
+    return (Grid[Room.Y][Room.X].BlockedWalls & (1 << Direction)) != 0;
+}
+
+bool AGridDungeonGenerator::AreRoomsAdjacent(const FIntPoint& A, const FIntPoint& B) const
+{
+    return (FMath::Abs(A.X - B.X) + FMath::Abs(A.Y - B.Y)) == 1;
+}
+
+// ========== КЛАССИФИКАЦИЯ РЕГИОНОВ ==========
+
+void AGridDungeonGenerator::ClassifyRegions()
+{
+    RegionCache.Empty();
+
+    TArray<TArray<bool>> Visited;
+    Visited.SetNum(GridHeight);
+    for (int32 Y = 0; Y < GridHeight; Y++)
+    {
+        Visited[Y].SetNum(GridWidth);
+        for (int32 X = 0; X < GridWidth; X++)
+        {
+            Visited[Y][X] = false;
+        }
+    }
+
+    for (int32 Y = 0; Y < GridHeight; Y++)
+    {
+        for (int32 X = 0; X < GridWidth; X++)
+        {
+            if (HasRoomAt(X, Y) && !Visited[Y][X])
+            {
+                TArray<FIntPoint> Region;
+                TQueue<FIntPoint> Queue;
+                Queue.Enqueue(FIntPoint(X, Y));
+                Visited[Y][X] = true;
+
+                while (!Queue.IsEmpty())
+                {
+                    FIntPoint Current;
+                    Queue.Dequeue(Current);
+                    Region.Add(Current);
+
+                    TArray<FIntPoint> Neighbors;
+                    if (HasRoomAt(Current.X + 1, Current.Y) && !IsWallBlocked(Current, 0))
+                        Neighbors.Add(FIntPoint(Current.X + 1, Current.Y));
+                    if (HasRoomAt(Current.X - 1, Current.Y) && !IsWallBlocked(Current, 2))
+                        Neighbors.Add(FIntPoint(Current.X - 1, Current.Y));
+                    if (HasRoomAt(Current.X, Current.Y + 1) && !IsWallBlocked(Current, 1))
+                        Neighbors.Add(FIntPoint(Current.X, Current.Y + 1));
+                    if (HasRoomAt(Current.X, Current.Y - 1) && !IsWallBlocked(Current, 3))
+                        Neighbors.Add(FIntPoint(Current.X, Current.Y - 1));
+
+                    for (const FIntPoint& Neighbor : Neighbors)
+                    {
+                        if (!Visited[Neighbor.Y][Neighbor.X])
+                        {
+                            Visited[Neighbor.Y][Neighbor.X] = true;
+                            Queue.Enqueue(Neighbor);
+                        }
+                    }
+                }
+
+                ERegionType Type = CalculateRegionType(Region);
+
+                for (const FIntPoint& Cell : Region)
+                {
+                    RegionCache.Add(Cell, Type);
+                }
+            }
+        }
+    }
+}
+
+ERegionType AGridDungeonGenerator::CalculateRegionType(const TArray<FIntPoint>& Region) const
+{
+    if (Region.Num() == 0) return ERegionType::Default;
+
+    int32 MinX = GridWidth, MaxX = -1, MinY = GridHeight, MaxY = -1;
+    for (const FIntPoint& Cell : Region)
+    {
+        MinX = FMath::Min(MinX, Cell.X);
+        MaxX = FMath::Max(MaxX, Cell.X);
+        MinY = FMath::Min(MinY, Cell.Y);
+        MaxY = FMath::Max(MaxY, Cell.Y);
+    }
+
+    int32 Width = MaxX - MinX + 1;
+    int32 Height = MaxY - MinY + 1;
+
+    if (Width == 1 || Height == 1)
+    {
+        return ERegionType::Corridor;
+    }
+    else if ((Width == 2 && Height == 2) || (Width == 2 && Height == 3) || (Width == 3 && Height == 2))
+    {
+        return ERegionType::SmallRoom;
+    }
+    else if (Width >= 3 && Height >= 3)
+    {
+        return ERegionType::LargeRoom;
+    }
+
+    return ERegionType::Default;
+}
+
+ERegionType AGridDungeonGenerator::GetRegionTypeAt(int32 X, int32 Y) const
+{
+    if (const ERegionType* Type = RegionCache.Find(FIntPoint(X, Y)))
+    {
+        return *Type;
+    }
+    return ERegionType::Default;
 }
 
 // ========== СОЗДАНИЕ КОМНАТ ==========
@@ -502,13 +941,14 @@ void AGridDungeonGenerator::ConfigureRoomWalls(ARoomBase* Room, int32 X, int32 Y
 {
     if (!Room) return;
 
-    bool bHasRightNeighbor = HasRoomAt(X + 1, Y);
-    bool bHasLeftNeighbor = HasRoomAt(X - 1, Y);
-    bool bHasDownNeighbor = HasRoomAt(X, Y - 1);
-    bool bHasUpNeighbor = HasRoomAt(X, Y + 1);
+    bool bHasRightNeighbor = HasRoomAt(X + 1, Y) && !IsWallBlocked(FIntPoint(X, Y), 0);
+    bool bHasLeftNeighbor = HasRoomAt(X - 1, Y) && !IsWallBlocked(FIntPoint(X, Y), 2);
+    bool bHasUpNeighbor = HasRoomAt(X, Y + 1) && !IsWallBlocked(FIntPoint(X, Y), 1);
+    bool bHasDownNeighbor = HasRoomAt(X, Y - 1) && !IsWallBlocked(FIntPoint(X, Y), 3);
 
     Room->SetNeighbors(bHasUpNeighbor, bHasDownNeighbor, bHasLeftNeighbor, bHasRightNeighbor);
 }
+
 // ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 
 bool AGridDungeonGenerator::IsValidCell(int32 X, int32 Y) const
@@ -592,11 +1032,49 @@ void AGridDungeonGenerator::DebugDrawGrid()
     {
         for (int32 X = 0; X < GridWidth; X++)
         {
+            if (!Grid[Y][X].bIsRoom) continue;
+
             FVector CellCenter = CenterOffset + FVector(X * CellSize + HalfCell, Y * CellSize + HalfCell, 100.0f);
-            FColor Color = Grid[Y][X].bIsRoom ? FColor::Green : FColor::Red;
+
+            FColor Color = FColor::Green;
+            ERegionType Type = GetRegionTypeAt(X, Y);
+            switch (Type)
+            {
+            case ERegionType::Corridor: Color = FColor::Yellow; break;
+            case ERegionType::SmallRoom: Color = FColor::Orange; break;
+            case ERegionType::LargeRoom: Color = FColor::Red; break;
+            default: Color = FColor::Green; break;
+            }
 
             DrawDebugBox(GetWorld(), CellCenter, FVector(HalfCell - 10, HalfCell - 10, 50), Color, false, DebugLineDuration);
             DrawDebugString(GetWorld(), CellCenter, FString::Printf(TEXT("%d,%d"), X, Y), nullptr, Color, DebugLineDuration);
         }
+    }
+}
+
+void AGridDungeonGenerator::DebugPrintRegions()
+{
+    UE_LOG(LogTemp, Warning, TEXT("=== REGION TYPES ==="));
+    for (int32 Y = 0; Y < GridHeight; Y++)
+    {
+        FString Line;
+        for (int32 X = 0; X < GridWidth; X++)
+        {
+            if (!HasRoomAt(X, Y))
+            {
+                Line.Append(" . ");
+                continue;
+            }
+
+            ERegionType Type = GetRegionTypeAt(X, Y);
+            switch (Type)
+            {
+            case ERegionType::Corridor: Line.Append(" C "); break;
+            case ERegionType::SmallRoom: Line.Append(" S "); break;
+            case ERegionType::LargeRoom: Line.Append(" L "); break;
+            default: Line.Append(" R "); break;
+            }
+        }
+        UE_LOG(LogTemp, Warning, TEXT("%s"), *Line);
     }
 }

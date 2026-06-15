@@ -16,7 +16,20 @@ struct FRoomCell
     UPROPERTY()
     int32 RoomTypeIndex = 0;
 
+    // Битовые флаги для заблокированных стен (0=Восток, 1=Юг, 2=Запад, 3=Север)
+    UPROPERTY()
+    uint8 BlockedWalls = 0;
+
     FRoomCell() {}
+};
+
+UENUM(BlueprintType)
+enum class ERegionType : uint8
+{
+    Corridor,   // 1 x N или N x 1
+    SmallRoom,  // 2x2, 2x3, 3x2
+    LargeRoom,  // 3x3 и больше
+    Default
 };
 
 UCLASS(Blueprintable, BlueprintType)
@@ -35,7 +48,7 @@ public:
     int32 GridHeight = 15;
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|Grid")
-    float CellSize = 1100.0f; // Размер комнаты + небольшой зазор
+    float CellSize = 1100.0f;
 
     // ========== НАСТРОЙКИ КОМНАТ ==========
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|Rooms")
@@ -67,6 +80,16 @@ public:
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|PostProcess")
     int32 MinRoomCount = 10;
 
+    // НОВЫЕ НАСТРОЙКИ
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|PostProcess|Maze")
+    bool bApplyMazePostProcess = true;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|PostProcess|Maze", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+    float WallRestoreChance = 0.35f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|PostProcess|Maze")
+    bool bUseMSTForConnectivity = true;
+
     // ========== НАСТРОЙКИ СИДА ==========
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|Seed")
     int32 Seed = 0;
@@ -83,6 +106,9 @@ public:
 
     UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|Debug")
     float DebugLineDuration = 5.0f;
+
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Dungeon|Debug")
+    bool bPrintRegionTypes = false;
 
     // ========== ПУБЛИЧНЫЕ ФУНКЦИИ ==========
     UFUNCTION(BlueprintCallable, Category = "Dungeon")
@@ -106,6 +132,16 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Dungeon")
     ARoomBase* GetRoomAt(int32 X, int32 Y) const;
 
+    UFUNCTION(BlueprintPure, Category = "Dungeon")
+    ERegionType GetRegionTypeAt(int32 X, int32 Y) const;
+
+    // ========== НОВЫЕ ФУНКЦИИ ДЛЯ РАБОТЫ С СИДОМ ==========
+    UFUNCTION(BlueprintCallable, Category = "Dungeon|Seed")
+    int32 GetRandomSeed();  // Возвращает случайный сид без генерации
+
+    UFUNCTION(BlueprintCallable, Category = "Dungeon|Seed")
+    void SetSeedAndGenerate(int32 NewSeed);  // Устанавливает сид и генерирует
+
 protected:
     virtual void BeginPlay() override;
 
@@ -117,6 +153,10 @@ private:
     TArray<TArray<FRoomCell>> Grid;
     TArray<ARoomBase*> SpawnedRooms;
     int32 CurrentSeed;
+    TMap<FIntPoint, ERegionType> RegionCache;
+
+    // Свой генератор случайных чисел
+    FRandomStream RNG;
 
     // ========== ГЕНЕРАЦИЯ СЕТКИ ==========
     void InitializeGrid();
@@ -129,30 +169,42 @@ private:
     void EnsureConnectivity();
     void AddCorridor(const FIntPoint& Start, const FIntPoint& End);
     void AddRandomConnections(int32 ExtraConnections = 2);
+    void FillInteriorHoles();
+    void EnsureAllRoomsConnected();
+    void CreateMinimalDungeon();
 
-    // ========== FLOOD FILL ДЛЯ КОМПОНЕНТ ==========
-    TArray<TArray<bool>> GetRoomClusters();
-    TArray<FIntPoint> GetLargestCluster();
-    TArray<FIntPoint> GetClusterAt(int32 StartX, int32 StartY, TArray<TArray<bool>>& OutVisited);
-
-    // ========== СОЗДАНИЕ КОМНАТ ==========
-    void SpawnRooms();
-    TSubclassOf<ARoomBase> SelectRoomType(int32 X, int32 Y) const;
-    void ConfigureRoomWalls(ARoomBase* Room, int32 X, int32 Y);
-
-    // ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+    // ========== БАЗОВЫЕ МЕТОДЫ РАБОТЫ С СЕТКОЙ ==========
     bool IsValidCell(int32 X, int32 Y) const;
     bool HasRoomAt(int32 X, int32 Y) const;
     TArray<FIntPoint> GetAdjacentRooms(int32 X, int32 Y) const;
     TArray<FIntPoint> GetAllRoomPositions() const;
     int32 GetManhattanDistance(const FIntPoint& A, const FIntPoint& B) const;
 
-    // ========== ОТЛАДКА ==========
-    void DebugDrawGrid();
+    // ========== МЕТОДЫ ДЛЯ ЛАБИРИНТА ==========
+    void PostProcessWallsToCreateMaze();
+    void CreateInternalMaze(const TArray<FIntPoint>& Region, int32 MinX, int32 MaxX, int32 MinY, int32 MaxY);
+    void AddRandomWallsToRegion(const TArray<FIntPoint>& Region);
+    void RestoreWallBetween(const FIntPoint& RoomA, const FIntPoint& RoomB);
+    void BlockWallAt(const FIntPoint& Room, int32 Direction);
+    bool IsWallBlocked(const FIntPoint& Room, int32 Direction) const;
+    bool AreRoomsAdjacent(const FIntPoint& A, const FIntPoint& B) const;
 
-    void CreateMinimalDungeon();
-    void FillInteriorHoles();
-    void EnsureAllRoomsConnected();
+    // ========== КЛАССИФИКАЦИЯ РЕГИОНОВ ==========
+    void ClassifyRegions();
+    ERegionType CalculateRegionType(const TArray<FIntPoint>& Region) const;
+
+    // ========== FLOOD FILL ДЛЯ КОМПОНЕНТ ==========
+    TArray<FIntPoint> GetLargestCluster();
+    TArray<FIntPoint> GetClusterAt(int32 StartX, int32 StartY, TArray<TArray<bool>>& OutVisited);
     TArray<TArray<FIntPoint>> GetAllClusters();
     FIntPoint FindBestConnectionPoint(const TArray<FIntPoint>& ClusterFrom, const TArray<FIntPoint>& ClusterTo);
+
+    // ========== СОЗДАНИЕ КОМНАТ ==========
+    void SpawnRooms();
+    TSubclassOf<ARoomBase> SelectRoomType(int32 X, int32 Y) const;
+    void ConfigureRoomWalls(ARoomBase* Room, int32 X, int32 Y);
+
+    // ========== ОТЛАДКА ==========
+    void DebugDrawGrid();
+    void DebugPrintRegions();
 };
